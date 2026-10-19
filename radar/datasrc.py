@@ -350,16 +350,24 @@ class DataForSEO(_Provider):
             url = "https://api.dataforseo.org/v3/" + self.PATHS[tool]
             r = aisa._post(url, arguments.get("body") or [], _TIMEOUT,
                            auth=self._auth())
-            if r.get("status_code") not in (None, 20000):
-                raise AisaError(f"dataforseo: {r.get('status_code')} "
-                                f"{str(r.get('status_message'))[:120]}")
             try:                                  # DFS bills in USD; a weird
                 micros = int(float(r.get("cost") or 0) * 1_000_000)   # cost
             except (TypeError, ValueError):       # must not kill the call —
                 micros = 0                        # the data already landed
-            self._spent += micros
-            return {"status_code": 20000, "result": r.get("result")
-                    or (((r.get("tasks") or [{}])[0]).get("result"))}, micros
+            self._spent += micros          # billed spend survives even a
+            if r.get("status_code") not in (None, 20000):     # failed task
+                raise AisaError(f"dataforseo: {r.get('status_code')} "
+                                f"{str(r.get('status_message'))[:120]}")
+            task = (r.get("tasks") or [{}])[0]
+            # DFS nests per-task failures (40xxx, result:null) below the
+            # top-level status — without this check a billed task error
+            # silently degrades to empty data
+            if task.get("status_code") not in (None, 20000):
+                raise AisaError(f"dataforseo {tool}: task "
+                                f"{task.get('status_code')} "
+                                f"{str(task.get('status_message'))[:120]}")
+            return {"status_code": 20000,
+                    "result": r.get("result") or task.get("result")}, micros
         except AisaError:
             raise
         except Exception as exc:

@@ -206,7 +206,8 @@ def call(calls: list[dict]) -> tuple[dict[str, dict], int]:
     # Pluggable data providers: RADAR_DATA_PROVIDER forces one ("aisa" pins
     # the router); without router creds the provider layer auto-selects
     provider = os.environ.get("RADAR_DATA_PROVIDER", "").strip()
-    if provider.lower() == "aisa":
+    pinned_router = provider.lower() == "aisa"
+    if pinned_router:
         if not _have_router_creds():
             raise AisaError("RADAR_DATA_PROVIDER=aisa but no router "
                             "credentials (set AISA_API_KEY or `aisa login`)")
@@ -219,8 +220,11 @@ def call(calls: list[dict]) -> tuple[dict[str, dict], int]:
     except AisaError as exc:
         # _have_router_creds() only checks ~/.aisa files EXIST — a stale/expired
         # key 401s here and would degrade every call for the rest of the run.
-        # If a direct provider is configured, fall back instead of dying.
-        if exc.status not in (401, 403):
+        # Auto mode: fall back to a direct provider if one is configured.
+        # A pinned RADAR_DATA_PROVIDER=aisa fails loud instead — silently
+        # serving via another provider would void the pin's contract and
+        # hide the switch in the daily report.
+        if exc.status not in (401, 403) or pinned_router:
             raise
         try:
             from . import datasrc
