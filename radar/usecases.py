@@ -489,7 +489,13 @@ def run(cfg: dict, state: Path, names: list[str], repos: dict[str, str], today: 
     related_errors: list[str] = []
     use_related = bool(goanyapi.key()) and c.get("related", True)
     for name in todo:
-        cands = [dict(u, source="model") for u in propose(c["model"], name, ev[name])]
+        try:
+            cands = [dict(u, source="model") for u in propose(c["model"], name, ev[name])]
+        except aisa.AisaError as exc:
+            # one failed proposer call must not abort the run — evidence()
+            # was already billed; degrade this name to no candidates, keep going
+            related_errors.append(f"{name}: propose: {exc}")
+            continue
         if use_related:
             try:
                 related, cost_r = goanyapi.related_queries(name, c["related_geo"])

@@ -29,22 +29,65 @@ SYSTEM = (
 )
 
 
-def parse(answer: str, n: int) -> dict[int, float]:
-    """{index: score} from the model's answer; indexes outside 0..n-1 and bad scores are dropped."""
-    m = re.search(r"\[.*\]", answer, re.S)
-    try:
-        items = json.loads(m.group(0)) if m else []
-    except ValueError:
+def _values(text: str) -> list:
+    """All JSON values in the text, rightmost-end first (largest span on
+    ties). raw_decode at each bracket offset yields COMPLETE balanced
+    values, so nested JSON after prose can't truncate the way a regex span
+    does. The ordering makes the final payload outrank earlier drafts
+    (```thinking blocks, "preliminary:" spans) and an enclosing array
+    outrank its own elements."""
+    out, decoder = [], json.JSONDecoder()
+    for m in re.finditer(r"[\[{]", text):
+        try:
+            obj, end = decoder.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        out.append((end, -m.start(), obj))
+    return [obj for _, __, obj in sorted(out, reverse=True)]
+
+
+def _scores_from(obj: object, n: int) -> dict[int, float]:
+    """{index: score} from one parsed JSON value; only well-formed in-range entries survive."""
+    if isinstance(obj, dict):
+        # object form some models emit instead of the array: {"0": 0.9, "1": 0.2};
+        # a lone {"i": k, "score": s} object is treated as a one-item array
+        items = [{"i": k, "score": v} for k, v in obj.items()] \
+            if "i" not in obj and "score" not in obj else [obj]
+    elif isinstance(obj, list):
+        items = obj
+    else:
         return {}
     out = {}
-    for it in items if isinstance(items, list) else []:
+    for it in items:
         try:
             i, score = int(it["i"]), float(it["score"])
         except (KeyError, TypeError, ValueError):
             continue
         if 0 <= i < n and 0.0 <= score <= 1.0:
             out[i] = score
+    if not out and isinstance(obj, dict):
+        # wrapped payloads — {"scores": [{...}]} or {"data": {"results": [...]}}:
+        # the enclosing dict yields no scores itself; descend into values
+        for v in obj.values():
+            if isinstance(v, (list, dict)):
+                out = _scores_from(v, n)
+                if out:
+                    break
     return out
+
+
+def parse(answer: str, n: int) -> dict[int, float]:
+    """{index: score} from the model's answer; indexes outside 0..n-1 and bad scores are dropped.
+
+    Tries each JSON-ish span in order — the whole payload, then every [..] / {..}
+    span — so prose, stray brackets or markdown fences around the real payload
+    can't sink the parse. Output shape stays strict: [{i, score}] or {index: score}.
+    """
+    for obj in _values(answer):
+        out = _scores_from(obj, n)
+        if out:
+            return out
+    return {}
 
 
 def score(rows: list[dict], model: str) -> dict:

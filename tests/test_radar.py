@@ -208,6 +208,31 @@ def test_judge_parses_scores_and_drops_what_it_cannot_use():
     assert judge.parse("sorry", 3) == {}
 
 
+def test_judge_parse_tolerates_fences_and_object_form():
+    # free models sometimes wrap the payload in a markdown fence
+    fenced = '```json\n[{"i": 0, "score": 0.9}, {"i": 1, "score": 0.2}]\n```'
+    assert judge.parse(fenced, 3) == {0: 0.9, 1: 0.2}
+    # ...or answer in object form {"index": score} (observed in the wild)
+    assert judge.parse('{"0": 0.9, "1": 0.2}', 3) == {0: 0.9, 1: 0.2}
+    # stray brackets in prose must not swallow the real span
+    mixed = 'scores [per run] look like [{i}] — actually: [{"i": 1, "score": 0.7}]'
+    assert judge.parse(mixed, 3) == {1: 0.7}
+    # strictness kept: out-of-range scores still dropped even in object form
+    assert judge.parse('{"0": 1.5, "1": 0.4}', 3) == {1: 0.4}
+    # wrapper envelopes — models that nest the array under a key must still parse
+    assert judge.parse('{"scores": [{"i": 0, "score": 0.9}]}', 3) == {0: 0.9}
+    assert judge.parse('{"data": {"results": [{"i": 1, "score": 0.3}]}}', 3) == {1: 0.3}
+    # a leading non-payload fence must not hide a later ```json block
+    two_fences = '```thinking\nlet me reason\n```\n```json\n[{"i": 0, "score": 0.7}]\n```'
+    assert judge.parse(two_fences, 3) == {0: 0.7}
+    # a draft score array — in a thinking fence or in prose — must not win
+    # over the final payload (reasoning models deliberate before answering)
+    assert judge.parse('```thinking\npreliminary: [{"i": 0, "score": 0.1}]\n```\n'
+                       'final: [{"i": 0, "score": 0.9}]', 3) == {0: 0.9}
+    assert judge.parse('preliminary: [{"i": 0, "score": 0.1}] — final: '
+                       '[{"i": 0, "score": 0.9}]', 3) == {0: 0.9}
+
+
 def test_judge_scores_rows_in_chunks(monkeypatch):
     rows = [{"term": f"t{i}", "examples": []} for i in range(judge.CHUNK + 2)]
     sizes = []
@@ -1085,3 +1110,186 @@ def test_tutorial_asks_only_for_leads_marked_one_click(cfg, monkeypatch):
     assert [x["term"] for x in out["leads"]] == ["opus blender game"] and out["cost_micros"] == 2000 + 1000
     text = "\n".join(report._tutorial_lines(out))
     assert "Too many manual steps (wants a tool, 1) → one click blender export" in text
+
+
+# --- datasrc: provider dispatch + response shaping --------------------------------
+
+from radar import datasrc, aisa as _aisa  # noqa: E402
+import pytest as _pytest  # noqa: E402
+
+
+def _no_creds(monkeypatch):
+    for k in ("WEBCAFE_TOKEN", "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD",
+              "AISA_API_KEY", "RADAR_DATA_PROVIDER"):
+        monkeypatch.delenv(k, raising=False)
+    datasrc._INSTANCES.clear()
+
+
+def test_datasrc_no_credentials_raises_aisa_error(monkeypatch):
+    _no_creds(monkeypatch)
+    with _pytest.raises(_aisa.AisaError):
+        datasrc.call([{"call_id": "c", "tool": datasrc.DFS_VOLUME, "arguments": {"body": []}}])
+
+
+def test_datasrc_unknown_provider_name_rejected(monkeypatch):
+    _no_creds(monkeypatch)
+    with _pytest.raises(_aisa.AisaError):
+        datasrc._select("madeup")
+
+
+def test_datasrc_forced_provider_without_creds_fails_loudly(monkeypatch):
+    _no_creds(monkeypatch)
+    with _pytest.raises(_aisa.AisaError):
+        datasrc._select("webcafe")
+
+
+def test_datasrc_unmapped_tool_raises_per_call(monkeypatch):
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc._select(None)
+    with _pytest.raises(_aisa.AisaError, match="no route"):
+        prov.call([{"call_id": "x", "tool": "post_twitter_search", "arguments": {}}])
+
+
+def test_datasrc_provider_instance_is_cached_across_batches(monkeypatch):
+    """call_all() batches through datasrc.call(); a fresh instance per batch
+    would reset the rate gate — selection must return the same object."""
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    a = datasrc._select(None)
+    b = datasrc._select(None)
+    assert a is b and a.name == "webcafe"
+
+
+def test_datasrc_range_rounds_up_not_nearest():
+    # 44-day window (review's 30d-before+14d-after): nearest would truncate to
+    # 30d and silently drop the baseline — must pick the smallest enum ≥ days
+    assert datasrc._range_of({"date_from": "2026-08-20", "date_to": "2026-10-03"}) == "90d"
+    assert datasrc._range_of({"date_from": "2026-10-01", "date_to": "2026-10-03"}) == "7d"
+    assert datasrc._range_of({}) == "90d"  # missing window → default
+
+
+def test_webcafe_volume_chunks_and_shapes(monkeypatch):
+    """Real webcafe shape: data.keywords is a dict-of-dicts {kw: {avg,
+    months:[{ym,v}]}} with months oldest→newest; DFS wants newest-first."""
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc.WebCafe()
+    calls = []
+
+    def fake_post(endpoint, payload):
+        calls.append(len(payload["keywords"]))
+        return {"credits": {"charged": 2},
+                "data": {"keywords": {
+                    f"kw{i}": {"avg": 100 + i,
+                               "months": [{"ym": "2026-08", "v": 90},
+                                          {"ym": "2026-09", "v": 80}]}
+                    if i != 3 else None               # null = no Ads data
+                    for i in range(len(payload["keywords"]))}}}, prov.CREDIT_MICROS * 2
+    monkeypatch.setattr(prov, "_post", fake_post)
+    task, micros = prov._handle(datasrc.DFS_VOLUME,
+                                {"body": [{"keywords": [f"k{i}" for i in range(120)]}]})
+    assert calls == [50, 50, 20]                     # chunked, not truncated
+    assert len(task["result"]) == 117                # 3 nulls dropped (i=3 per chunk)
+    row = task["result"][0]
+    assert row == {"keyword": "kw0", "search_volume": 100,
+                   "monthly_searches": [{"year": 2026, "month": 9, "search_volume": 80},
+                                        {"year": 2026, "month": 8, "search_volume": 90}]}
+    assert micros == 2 * prov.CREDIT_MICROS * 3
+
+
+def test_webcafe_trends_normalizes_epoch_and_dates(monkeypatch):
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc.WebCafe()
+    monkeypatch.setattr(prov, "_post", lambda e, p: (
+        {"points": [{"timestamp": 1759190400, "value": 42},
+                    {"timestamp": 1759190400000, "value": 9},       # epoch millis
+                    {"date": "2026-10-01", "values": [7, 8]},
+                    {"values": [1]},                                # no date → skipped
+                    {"date": "2026/10/01", "value": 5},             # non-ISO → skipped
+                    {"date": 5, "value": 5},                        # tiny epoch → skipped
+                    {"date": True, "value": 5},                     # bool → skipped
+                    {"date": "2026-10-02", "values": [{"bad": 1}]}]}, 0))
+    task, _ = prov._handle(datasrc.DFS_TRENDS, {"body": [{"keywords": ["a", "b"]}]})
+    data = task["result"][0]["items"][0]["data"]
+    assert data[0] == {"date_from": "2025-09-30", "values": [42]}   # epoch → ISO
+    assert data[1] == {"date_from": "2025-09-30", "values": [9]}    # millis → ISO
+    assert data[2] == {"date_from": "2026-10-01", "values": [7, 8]}
+    assert data[3] == {"date_from": "2026-10-02", "values": [0]}    # unusable values → 0
+    assert len(data) == 4                                           # poison points dropped, call survives
+
+
+def test_webcafe_serp_shapes_organic_link_rows(monkeypatch):
+    """Real webcafe shape: data.organic[] uses link/position, not url/rank."""
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc.WebCafe()
+    monkeypatch.setattr(prov, "_post", lambda e, p: (
+        {"data": {"organic": [{"link": "https://www.medium.com/a", "title": "t", "position": 2},
+                              {"title": "no link"},
+                              {"link": "https://x.io/b"}]}}, 0))
+    task, _ = prov._handle(datasrc.DFS_SERP, {"body": [{"keyword": "k"}]})
+    items = task["result"][0]["items"]
+    assert len(items) == 2
+    assert items[0] == {"type": "organic", "domain": "medium.com",
+                        "url": "https://www.medium.com/a", "title": "t", "rank_group": 2}
+    assert items[1]["domain"] == "x.io" and items[1]["rank_group"] == 3
+
+
+def test_webcafe_kd_reads_data_score(monkeypatch):
+    """Real webcafe shape: data.score is the 0-100 difficulty."""
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc.WebCafe()
+    monkeypatch.setattr(prov, "_post", lambda e, p: (
+        {"data": {"keyword": p["keyword"], "score": 42, "level": "中"}}, 0))
+    task, _ = prov._handle(datasrc.DFS_KD, {"body": [{"keywords": ["a", "b"]}]})
+    items = task["result"][0]["items"]
+    assert items == [{"keyword": "a", "keyword_properties": {"keyword_difficulty": 42}},
+                     {"keyword": "b", "keyword_properties": {"keyword_difficulty": 42}}]
+
+
+def test_webcafe_shaping_surprise_becomes_aisa_error(monkeypatch):
+    """Any non-AisaError escape from provider internals must be re-wrapped —
+    upstream degrade paths only catch AisaError, anything else kills the
+    whole usecases block for the day."""
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc.WebCafe()
+
+    def boom(endpoint, payload):
+        raise RuntimeError("unexpected payload surprise")
+    monkeypatch.setattr(prov, "_post", boom)
+    with _pytest.raises(_aisa.AisaError, match="webcafe"):
+        prov._handle(datasrc.DFS_VOLUME, {"body": [{"keywords": ["k"]}]})
+
+
+def test_datasrc_call_without_call_id_rejected(monkeypatch):
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc._select(None)
+    with _pytest.raises(_aisa.AisaError, match="call_id"):
+        prov.call([{"tool": datasrc.DFS_VOLUME, "arguments": {}}])
+
+
+def test_datasrc_partial_failure_keeps_billed_spend(monkeypatch):
+    """A raise mid-batch must not lose the cost of requests that already billed
+    — _spent accumulates per request and folds into the next call's total."""
+    _no_creds(monkeypatch)
+    monkeypatch.setenv("WEBCAFE_TOKEN", "t")
+    prov = datasrc.WebCafe()
+    prov.min_interval = 0
+    n = [0]
+
+    def fake(url, payload, timeout, **kw):
+        n[0] += 1
+        if n[0] == 2:
+            raise _aisa.AisaError("boom")
+        return {"credits": {"charged": 2}, "data": []}
+    monkeypatch.setattr(_aisa, "_post", fake)
+    with _pytest.raises(_aisa.AisaError):
+        prov._handle(datasrc.DFS_KD, {"body": [{"keywords": ["a", "b"]}]})   # 2nd request dies
+    _out, micros = prov.call([{"call_id": "c", "tool": datasrc.DFS_SERP,
+                               "arguments": {"body": [{}]}}])
+    assert micros == prov.CREDIT_MICROS * 2 * 2   # kd's billed request + serp's
