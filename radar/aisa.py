@@ -203,13 +203,32 @@ def call(calls: list[dict]) -> tuple[dict[str, dict], int]:
         return {}, 0
     if len(calls) > MAX_CALLS:
         raise AisaError(f"{len(calls)} calls in one batch, the cap is {MAX_CALLS}")
-    # Pluggable data providers: RADAR_DATA_PROVIDER forces one; without router
-    # creds the provider layer auto-selects (see radar/datasrc.py)
+    # Pluggable data providers: RADAR_DATA_PROVIDER forces one ("aisa" pins
+    # the router); without router creds the provider layer auto-selects
     provider = os.environ.get("RADAR_DATA_PROVIDER", "").strip()
+    if provider.lower() == "aisa":
+        if not _have_router_creds():
+            raise AisaError("RADAR_DATA_PROVIDER=aisa but no router "
+                            "credentials (set AISA_API_KEY or `aisa login`)")
+        provider = ""
     if provider or not _have_router_creds():
         from . import datasrc
         return datasrc.call(calls, provider or None)
-    body = _post(ROUTER, {"calls": calls}, TIMEOUT)
+    try:
+        body = _post(ROUTER, {"calls": calls}, TIMEOUT)
+    except AisaError as exc:
+        # _have_router_creds() only checks ~/.aisa files EXIST — a stale/expired
+        # key 401s here and would degrade every call for the rest of the run.
+        # If a direct provider is configured, fall back instead of dying.
+        if exc.status not in (401, 403):
+            raise
+        try:
+            from . import datasrc
+            return datasrc.call(calls)
+        except AisaError as fb:
+            raise AisaError(
+                f"router auth failed (HTTP {exc.status}) and provider "
+                f"fallback failed: {fb}") from exc
     if "error" in body:
         raise AisaError(str(body["error"].get("message") or body["error"])[:200])
     out, cost = {}, 0
@@ -292,6 +311,11 @@ def chat(model: str, system: str, user: str, max_tokens: int | None = None) -> s
                 # network failure or 5xx may have completed (and billed)
                 # server-side, so a blind retry can double-bill
                 raise
+            # custom endpoints retry all transient failures, including
+            # network/5xx — right for free-tier reasoning models, but a PAID
+            # custom endpoint can double-bill the same way. The deadline
+            # bounds the blast radius; treat RADAR_LLM_BASE_URL pricing as
+            # "you own the overage" until this gains a 429-only mode.
             time.sleep(5 * (attempt + 1))
     else:
         raise last or AisaError("chat failed")

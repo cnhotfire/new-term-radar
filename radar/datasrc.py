@@ -59,8 +59,15 @@ def _num(row: dict, *keys) -> int | None:
 
 def _gl(location_code) -> str:
     """DataForSEO numeric location → web.cafe's `gl` country code."""
-    return {2840: "us", 2826: "gb", 2124: "ca", 2036: "au", 2276: "de",
-            2392: "jp", 2702: "sg"}.get(location_code, "us")
+    if not location_code:
+        return "us"
+    gl = {2840: "us", 2826: "gb", 2124: "ca", 2036: "au", 2276: "de",
+          2392: "jp", 2702: "sg"}.get(location_code)
+    if gl is None:
+        # a real-but-unmapped code silently pulling US data is worse than a
+        # loud error — extend the map when adding geos
+        raise AisaError(f"unmapped location_code {location_code!r} (extend _gl)")
+    return gl
 
 
 def _range_of(body: dict) -> str:
@@ -270,7 +277,14 @@ class WebCafe(_Provider):
             "q": body.get("keyword") or "",
             "gl": _gl(body.get("location_code")),
             "hl": body.get("language_code") or "en"})
-        rows = (r.get("data") or {}).get("organic") or _dig(r, "link") or []
+        rows = (r.get("data") or {}).get("organic")
+        if rows is None:
+            # _dig(r, "link") would happily return related/answer_box lists and
+            # stamp them "organic" — a missing block is a shaping surprise, so
+            # it must raise like the rest of this module's contract says
+            raise AisaError("serp response missing data.organic")
+        if not isinstance(rows, list):
+            raise AisaError(f"serp data.organic is not a list: {type(rows).__name__}")
         items = []
         for i, row in enumerate(rows):
             if len(items) >= 10:

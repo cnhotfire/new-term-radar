@@ -1286,10 +1286,64 @@ def test_datasrc_partial_failure_keeps_billed_spend(monkeypatch):
         n[0] += 1
         if n[0] == 2:
             raise _aisa.AisaError("boom")
-        return {"credits": {"charged": 2}, "data": []}
+        return {"credits": {"charged": 2}, "data": {"organic": []}}
     monkeypatch.setattr(_aisa, "_post", fake)
     with _pytest.raises(_aisa.AisaError):
         prov._handle(datasrc.DFS_KD, {"body": [{"keywords": ["a", "b"]}]})   # 2nd request dies
     _out, micros = prov.call([{"call_id": "c", "tool": datasrc.DFS_SERP,
                                "arguments": {"body": [{}]}}])
     assert micros == prov.CREDIT_MICROS * 2 * 2   # kd's billed request + serp's
+
+
+# --- aisa pure helpers: URL normalization, credential scoping -----------------
+
+def test_aisa_host_rejects_lookalike_domains():
+    assert _aisa._aisa_host("https://api.aisa.one/v1")
+    assert _aisa._aisa_host("https://aisa.one/x")
+    assert not _aisa._aisa_host("https://aisa.one.evil.tld")
+    assert not _aisa._aisa_host("https://openrouter.ai/api/v1")
+    assert not _aisa._aisa_host("not a url")
+
+
+def test_chat_url_normalizes_openrouter_suffixes(monkeypatch):
+    monkeypatch.setenv("RADAR_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    assert _aisa._chat_url() == "https://openrouter.ai/api/v1/chat/completions"
+    monkeypatch.setenv("RADAR_LLM_BASE_URL", "openrouter.ai")
+    assert _aisa._chat_url() == "https://openrouter.ai/api/v1/chat/completions"
+    monkeypatch.delenv("RADAR_LLM_BASE_URL")
+    monkeypatch.delenv("AISA_API_BASE_URL", raising=False)
+    assert _aisa._chat_url() == "https://api.aisa.one/v1/chat/completions"
+
+
+def test_chat_url_appends_to_generic_bases(monkeypatch):
+    monkeypatch.setenv("RADAR_LLM_BASE_URL", "https://llm.example.com/v1")
+    assert _aisa._chat_url() == "https://llm.example.com/v1/chat/completions"
+    monkeypatch.setenv("RADAR_LLM_BASE_URL",
+                       "https://llm.example.com/v1/chat/completions")
+    assert _aisa._chat_url() == "https://llm.example.com/v1/chat/completions"
+
+
+def test_llm_key_never_sends_aisa_credential_to_custom_endpoint(monkeypatch):
+    # custom endpoint resolved → aisa creds must NOT go out; RADAR_LLM_API_KEY required
+    monkeypatch.setattr(_aisa, "CHAT", "https://llm.example.com/v1/chat/completions")
+    monkeypatch.setenv("AISA_API_KEY", "aisa-key-must-not-leak")
+    monkeypatch.delenv("RADAR_LLM_API_KEY", raising=False)
+    with _pytest.raises(_aisa.AisaError, match="RADAR_LLM_API_KEY"):
+        _aisa.llm_key()
+    monkeypatch.setenv("RADAR_LLM_API_KEY", "ok")
+    assert _aisa.llm_key() == "ok"
+
+
+def test_llm_key_on_aisa_host_prefers_aisa_credential(monkeypatch):
+    monkeypatch.setattr(_aisa, "CHAT", "https://api.aisa.one/v1/chat/completions")
+    monkeypatch.setenv("AISA_API_KEY", "the-aisa-key")
+    monkeypatch.setenv("RADAR_LLM_API_KEY", "scoped-to-custom")
+    # on aisa.one the scoped key must not leak as the chat credential either
+    assert _aisa.llm_key() == "the-aisa-key"
+
+
+# _post's own guards (cleartext off-loopback, explicit-key for non-aisa hosts,
+# HTTPException wrapping) live inside the function conftest stubs for every
+# test — they can't be exercised without defeating the "no network" fixture.
+# The reachable halves are covered above: _aisa_host (what the Bearer/x-aisa-
+# source decisions key on) and llm_key (which key goes where).
